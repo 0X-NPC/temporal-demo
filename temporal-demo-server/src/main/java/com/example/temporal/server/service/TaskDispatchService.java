@@ -1,16 +1,19 @@
 package com.example.temporal.server.service;
 
-import com.example.temporal.common.TaskExecutionWorkflow;
+import com.example.temporal.common.PingWorkflow;
+import com.example.temporal.common.TaskWorkflow;
+import com.example.temporal.model.TaskArgs;
 import com.example.temporal.model.TaskStatus;
+import com.example.temporal.server.constants.TaskType;
 import io.temporal.api.common.v1.WorkflowExecution;
 import io.temporal.api.enums.v1.WorkflowExecutionStatus;
+import io.temporal.api.enums.v1.WorkflowIdReusePolicy;
 import io.temporal.api.workflow.v1.WorkflowExecutionInfo;
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowOptions;
 import io.temporal.client.WorkflowStub;
-import io.temporal.serviceclient.WorkflowServiceStubs;
-import io.temporal.serviceclient.WorkflowServiceStubsOptions;
-import jakarta.annotation.PostConstruct;
+import io.temporal.internal.worker.WorkflowExecutionException;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -23,45 +26,94 @@ import java.util.Optional;
  */
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class TaskDispatchService {
 
-    private WorkflowClient client;
+    private final WorkflowClient workflowClient;
 
-    @PostConstruct
-    public void init() {
-        String temporalAddress = "127.0.0.1:7233";
-        // 连接 Temporal Server
-        WorkflowServiceStubs service = WorkflowServiceStubs.newServiceStubs(
-                WorkflowServiceStubsOptions.newBuilder()
-                        // K8s 内部地址
-                        .setTarget(temporalAddress)
-                        .build());
-        this.client = WorkflowClient.newInstance(service);
+    /**
+     * 1. 下发任务（支持同步/异步）
+     *
+     * @param taskType 任务类型 (SYNC/ASYNC)
+     * @param region   目标区域 (Queue Name)
+     * @param taskId   业务任务ID (WorkflowId)
+     * @param command  业务指令
+     * @return 如果是 ASYNC，返回 RunId；如果是 SYNC，返回任务的执行结果
+     */
+    public String dispatchTask(TaskType taskType, String region, String taskId, String command) {
+        // 1. 构建 Workflow 配置
+        WorkflowOptions options = WorkflowOptions.newBuilder()
+                .setTaskQueue(region)               // 核心：路由到指定区域
+                .setWorkflowId(taskId)              // 核心：业务ID去重
+                // 策略建议：仅允许在上一条相同ID的任务 失败/超时/终止 后，才允许复用ID。
+                // 如果上一条还在运行，这里会报错 (WorkflowExecutionAlreadyStarted)
+                .setWorkflowIdReusePolicy(WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY)
+                .build();
+        // 2. 准备参数
+        TaskArgs args = TaskArgs.builder().build();
+
+        // 3. 根据类型分发
+        if (TaskType.SYNC == taskType) {
+            // 同步模式
+            // 创建 Workflow 存根 (Client Stub)
+            PingWorkflow syncWorkflow = workflowClient.newWorkflowStub(
+                    PingWorkflow.class, options
+            );
+            return dispatchSync(syncWorkflow, region, taskId, command, args);
+        } else {
+            // 异步模式
+            TaskWorkflow workflow = workflowClient.newWorkflowStub(
+                    TaskWorkflow.class, options
+            );
+            return dispatchAsync(workflow, region, taskId, command, args);
+        }
     }
 
     /**
-     * 1. 任务下发 (Dispatch)
-     *
-     * @param region  目标区域，对应 Queue Name (e.g., "queue-beijing")
-     * @param taskId  原有调度系统的任务ID (用于去重和追踪)
-     * @param command 具体的任务参数
-     * @return runId Temporal 的运行ID
+     * 处理异步任务 (Fire and Forget)
      */
-    public String dispatchTask(String region, String taskId, String command) {
-        // 创建 Workflow 存根
-        TaskExecutionWorkflow workflow = client.newWorkflowStub(
-                TaskExecutionWorkflow.class,
-                WorkflowOptions.newBuilder()
-                        .setTaskQueue(region)   // 核心：通过 Queue 路由到指定隔离网络
-                        .setWorkflowId(taskId)  // 核心：使用业务ID作为 WorkflowId，防止重复下发
-                        .build());
+    private String dispatchAsync(TaskWorkflow workflow, String region, String taskId, String command, TaskArgs args) {
+        try {
+            // WorkflowClient.start 是异步非阻塞的，发送成功即返回
+            WorkflowExecution execution = WorkflowClient.start(
+                    workflow::executeTask,
+                    command,
+                    args
+            );
 
-        // 异步启动 (Fire and Forget)
-        // 调度服务通常不希望阻塞等待任务结束
-        WorkflowExecution execution = WorkflowClient.start(workflow::executeTask, command);
+            log.info("[ASYNC] 任务已下发: Region={}, ID={}, RunID={}", region, taskId, execution.getRunId());
+            // 异步模式返回 RunID，方便调用方后续查询状态
+            return execution.getRunId();
 
-        log.info("任务已下发: Region={}, ID={}, RunID={}", region, taskId, execution.getRunId());
-        return execution.getRunId();
+        } catch (Exception e) {
+            log.error("[ASYNC] 任务下发失败: Region={}, ID={}", region, taskId, e);
+            throw new RuntimeException("异步任务下发失败", e);
+        }
+    }
+
+    /**
+     * 处理同步任务 (Blocking Wait)
+     */
+    private String dispatchSync(PingWorkflow workflow, String region, String taskId, String command, TaskArgs args) {
+        log.info("[SYNC] 开始同步调用: Region={}, ID={}", region, taskId);
+        Long startTime = System.currentTimeMillis();
+        try {
+            // 直接调用接口方法，会阻塞当前线程，直到 Workflow 执行完毕
+            // 如果 Workflow 执行失败，这里会抛出 WorkflowException
+            String result = workflow.executeTask(command, args);
+
+            long costTime = System.currentTimeMillis() - startTime;
+            log.info("[SYNC] 任务执行完成: Region={}, ID={}, Result={}, Cost={}ms", region, taskId, result, costTime);
+            // 同步模式直接返回业务结果
+            return result;
+
+        } catch (WorkflowExecutionException e) {
+            log.error("[SYNC] 任务执行异常: Region={}, ID={}", region, taskId, e);
+            throw new RuntimeException("同步任务执行失败: " + e.getMessage(), e);
+        } catch (Exception e) {
+            log.error("[SYNC] 调用系统异常: Region={}, ID={}", region, taskId, e);
+            throw new RuntimeException("同步任务系统异常", e);
+        }
     }
 
     /**
@@ -78,7 +130,7 @@ public class TaskDispatchService {
         try {
             // 1. 创建无类型的 Stub (UntypedStub)
             // 这是一个轻量级对象，用于操作已存在的 Workflow
-            WorkflowStub stub = client.newUntypedWorkflowStub(taskId, Optional.empty(), Optional.empty());
+            WorkflowStub stub = workflowClient.newUntypedWorkflowStub(taskId, Optional.empty(), Optional.empty());
 
             // 2. 调用 Describe 获取元数据 (这是一个 RPC 请求)
             // 注意：如果 WorkflowId 不存在，这里会抛出异常
@@ -146,9 +198,9 @@ public class TaskDispatchService {
      * @return
      */
     public String getResultSync(String taskId) {
-        TaskExecutionWorkflow workflow = client.newWorkflowStub(TaskExecutionWorkflow.class, taskId);
+        TaskWorkflow workflow = workflowClient.newWorkflowStub(TaskWorkflow.class, taskId);
         // 这会阻塞直到任务完成
-        return workflow.executeTask(null);
+        return workflow.executeTask(null, TaskArgs.builder().build());
     }
 
 }

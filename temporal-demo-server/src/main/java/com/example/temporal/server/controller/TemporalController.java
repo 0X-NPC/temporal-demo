@@ -32,14 +32,14 @@ public class TemporalController {
     @PostMapping(value = "/")
     public ResponseEntity<String> runTask(@Valid @RequestBody TaskReq taskReq) {
         String taskId = UUID.randomUUID().toString();
-        taskDispatchService.dispatchTask(taskReq.getRegion(), taskId, taskReq.getCommand());
-        return ResponseEntity.ok(taskId);
+        String result = taskDispatchService.dispatchTask(taskReq.getTaskType(), taskReq.getRegion(), taskId, taskReq.getCommand());
+        return ResponseEntity.ok(taskId + ": " + result);
     }
 
 
     @Operation(summary = "任务状态", description = "查询任务状态")
     @GetMapping(value = "/{taskId}/status", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<TaskStatus>  getTaskStatus(@Valid @PathVariable(name = "taskId") String taskId) {
+    public ResponseEntity<TaskStatus> getTaskStatus(@Valid @PathVariable(name = "taskId") String taskId) {
         TaskStatus taskStatus = taskDispatchService.checkStatus(taskId);
         return ResponseEntity.ok(taskStatus);
     }
